@@ -1,29 +1,76 @@
-#include <wb.h>
+// Sparse Matrix-Vector Multiplication using JDS format
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <assert.h>
 
-#define wbCheck(stmt)                                                     \
-  do {                                                                    \
-    cudaError_t err = stmt;                                               \
-    if (err != cudaSuccess) {                                             \
-      wbLog(ERROR, "Failed to run stmt ", #stmt);                         \
-      wbLog(ERROR, "Got CUDA error ...  ", cudaGetErrorString(err));      \
-      return -1;                                                          \
-    }                                                                     \
-  } while (0)
+// CSR to JDS conversion
+// Input: dim, csrRowPtr, csrColIdx, csrVal (CSR format)
+// Output: jdsRowPerm, jdsRows, jdsColStart, jdsCols, jdsData (JDS format)
+static void CSRToJDS(int dim, int *csrRowPtr, int *csrColIdx, float *csrVal,
+                     int **jdsRowPerm, int **jdsRows, int **jdsColStart,
+                     int **jdsCols, float **jdsData) {
+  int maxRowNNZ = 0;
+
+  // Count non-zeros per row and find max
+  int *rowLen = (int *)malloc(dim * sizeof(int));
+  for (int i = 0; i < dim; i++) {
+    rowLen[i] = csrRowPtr[i + 1] - csrRowPtr[i];
+    if (rowLen[i] > maxRowNNZ) maxRowNNZ = rowLen[i];
+  }
+
+  // Sort rows by length descending (simple O(n^2) for small dims)
+  *jdsRowPerm = (int *)malloc(dim * sizeof(int));
+  for (int i = 0; i < dim; i++) (*jdsRowPerm)[i] = i;
+  for (int i = 0; i < dim; i++) {
+    for (int j = i + 1; j < dim; j++) {
+      if (rowLen[(*jdsRowPerm)[j]] > rowLen[(*jdsRowPerm)[i]]) {
+        int tmp = (*jdsRowPerm)[i];
+        (*jdsRowPerm)[i] = (*jdsRowPerm)[j];
+        (*jdsRowPerm)[j] = tmp;
+      }
+    }
+  }
+
+  *jdsRows = (int *)malloc(dim * sizeof(int));
+  for (int i = 0; i < dim; i++) {
+    (*jdsRows)[i] = rowLen[(*jdsRowPerm)[i]];
+  }
+
+  // Build jdsColStart: offset for each section
+  *jdsColStart = (int *)malloc((maxRowNNZ + 1) * sizeof(int));
+  (*jdsColStart)[0] = 0;
+  for (int sec = 0; sec < maxRowNNZ; sec++) {
+    int count = 0;
+    for (int i = 0; i < dim; i++) {
+      if ((*jdsRows)[i] > sec) count++;
+    }
+    (*jdsColStart)[sec + 1] = (*jdsColStart)[sec] + count;
+  }
+
+  int ndata = csrRowPtr[dim];
+  *jdsCols = (int *)malloc(ndata * sizeof(int));
+  *jdsData = (float *)malloc(ndata * sizeof(float));
+
+  // Fill JDS arrays section by section
+  for (int i = 0; i < dim; i++) {
+    int origRow = (*jdsRowPerm)[i];
+    int len = (*jdsRows)[i];
+    for (int sec = 0; sec < len; sec++) {
+      int pos = (*jdsColStart)[sec] + i;
+      int csrIdx = csrRowPtr[origRow] + sec;
+      (*jdsCols)[pos] = csrColIdx[csrIdx];
+      (*jdsData)[pos] = csrVal[csrIdx];
+    }
+  }
+
+  free(rowLen);
+}
 
 __global__ void spmvJDSKernel(float *out, int *matColStart, int *matCols,
                               int *matRowPerm, int *matRows,
                               float *matData, float *vec, int dim) {
   //@@ insert spmv kernel for jds format
-  int row = blockIdx.x * blockDim.x + threadIdx.x;
-  if (row < dim) {
-    float dot = 0;
-    unsigned int sec = 0;
-    while (sec < matRows[row]) {
-      dot += matData[matColStart[sec] + row] * vec[matCols[matColStart[sec] + row]];
-      sec++;
-    }
-    out[matRowPerm[row]] = dot;
-  }
 }
 
 static void spmvJDS(float *out, int *matColStart, int *matCols,
@@ -31,15 +78,39 @@ static void spmvJDS(float *out, int *matColStart, int *matCols,
                     float *vec, int dim) {
 
   //@@ invoke spmv kernel for jds format
-  dim3 dimGrid((dim + 256 - 1) / 256, 1, 1);
-  dim3 dimBlock(256, 1, 1);
-  spmvJDSKernel<<<dimGrid, dimBlock>>>(out, matColStart, matCols, matRowPerm,
-                                       matRows, matData, vec, dim);
-  cudaDeviceSynchronize();
 }
 
 int main(int argc, char **argv) {
-  wbArg_t args;
+  char *expected_file = NULL;
+  char *input_files[16];
+  int num_inputs = 0;
+  char *dataset_type = NULL;
+
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "-e") == 0 && i + 1 < argc) {
+      expected_file = argv[++i];
+    } else if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) {
+      char *start = argv[++i];
+      for (char *p = start; ; p++) {
+        if (*p == ',' || *p == '\0') {
+          input_files[num_inputs] = (char *)malloc(p - start + 1);
+          memcpy(input_files[num_inputs], start, p - start);
+          input_files[num_inputs][p - start] = '\0';
+          num_inputs++;
+          start = p + 1;
+          if (*p == '\0') break;
+        }
+      }
+    } else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
+      dataset_type = argv[++i];
+    }
+  }
+
+  if (!expected_file || num_inputs < 4) {
+    fprintf(stderr, "Usage: %s -e <expected> -i <col,row,data,vec> -t <type>\n", argv[0]);
+    return 1;
+  }
+
   int *hostCSRCols;
   int *hostCSRRows;
   float *hostCSRData;
@@ -60,65 +131,87 @@ int main(int argc, char **argv) {
   int dim, ncols, nrows, ndata;
   int maxRowNNZ;
 
-  args = wbArg_read(argc, argv);
+  // Read input 0 (cols)
+  {
+    FILE *f = fopen(input_files[0], "r");
+    assert(f != NULL);
+    fscanf(f, "%d", &ncols);
+    hostCSRCols = (int *)malloc(ncols * sizeof(int));
+    for (int i = 0; i < ncols; i++) fscanf(f, "%d", &hostCSRCols[i]);
+    fclose(f);
+  }
 
-  wbTime_start(Generic, "Importing data and creating memory on host");
-  hostCSRCols = (int *)wbImport(wbArg_getInputFile(args, 0), &ncols, "Integer");
-  hostCSRRows = (int *)wbImport(wbArg_getInputFile(args, 1), &nrows, "Integer");
-  hostCSRData = (float *)wbImport(wbArg_getInputFile(args, 2), &ndata, "Real");
-  hostVector = (float *)wbImport(wbArg_getInputFile(args, 3), &dim, "Real");
+  // Read input 1 (rows)
+  {
+    FILE *f = fopen(input_files[1], "r");
+    assert(f != NULL);
+    fscanf(f, "%d", &nrows);
+    hostCSRRows = (int *)malloc(nrows * sizeof(int));
+    for (int i = 0; i < nrows; i++) fscanf(f, "%d", &hostCSRRows[i]);
+    fclose(f);
+  }
+
+  // Read input 2 (data)
+  {
+    FILE *f = fopen(input_files[2], "r");
+    assert(f != NULL);
+    fscanf(f, "%d", &ndata);
+    hostCSRData = (float *)malloc(ndata * sizeof(float));
+    for (int i = 0; i < ndata; i++) fscanf(f, "%f", &hostCSRData[i]);
+    fclose(f);
+  }
+
+  // Read input 3 (vector)
+  {
+    FILE *f = fopen(input_files[3], "r");
+    assert(f != NULL);
+    fscanf(f, "%d", &dim);
+    hostVector = (float *)malloc(dim * sizeof(float));
+    for (int i = 0; i < dim; i++) fscanf(f, "%f", &hostVector[i]);
+    fclose(f);
+  }
 
   hostOutput = (float *)malloc(sizeof(float) * dim);
 
-  wbTime_stop(Generic, "Importing data and creating memory on host");
-
-  CSRToJDS(dim, hostCSRRows, hostCSRCols, hostCSRData, &hostJDSRowPerm, &hostJDSRows,
-           &hostJDSColStart, &hostJDSCols, &hostJDSData);
+  CSRToJDS(dim, hostCSRRows, hostCSRCols, hostCSRData,
+           &hostJDSRowPerm, &hostJDSRows, &hostJDSColStart, &hostJDSCols, &hostJDSData);
   maxRowNNZ = hostJDSRows[0];
 
-  wbTime_start(GPU, "Allocating GPU memory.");
-  cudaMalloc((void **)&deviceJDSColStart, sizeof(int) * maxRowNNZ);
-  cudaMalloc((void **)&deviceJDSCols, sizeof(int) * ndata);
-  cudaMalloc((void **)&deviceJDSRowPerm, sizeof(int) * dim);
-  cudaMalloc((void **)&deviceJDSRows, sizeof(int) * dim);
-  cudaMalloc((void **)&deviceJDSData, sizeof(float) * ndata);
+  //@@ Allocate GPU memory here
 
-  cudaMalloc((void **)&deviceVector, sizeof(float) * dim);
-  cudaMalloc((void **)&deviceOutput, sizeof(float) * dim);
-  wbTime_stop(GPU, "Allocating GPU memory.");
+  //@@ Copy memory to the GPU here
 
-  wbTime_start(GPU, "Copying input memory to the GPU.");
-  cudaMemcpy(deviceJDSColStart, hostJDSColStart, sizeof(int) * maxRowNNZ,
-             cudaMemcpyHostToDevice);
-  cudaMemcpy(deviceJDSCols, hostJDSCols, sizeof(int) * ndata, cudaMemcpyHostToDevice);
-  cudaMemcpy(deviceJDSRowPerm, hostJDSRowPerm, sizeof(int) * dim, cudaMemcpyHostToDevice);
-  cudaMemcpy(deviceJDSRows, hostJDSRows, sizeof(int) * dim, cudaMemcpyHostToDevice);
-  cudaMemcpy(deviceJDSData, hostJDSData, sizeof(float) * ndata, cudaMemcpyHostToDevice);
-  cudaMemcpy(deviceVector, hostVector, sizeof(float) * dim, cudaMemcpyHostToDevice);
-  wbTime_stop(GPU, "Copying input memory to the GPU.");
+  //@@ Launch the GPU Kernel here
 
-  wbTime_start(Compute, "Performing CUDA computation");
-  spmvJDS(deviceOutput, deviceJDSColStart, deviceJDSCols, deviceJDSRowPerm, deviceJDSRows,
-          deviceJDSData, deviceVector, dim);
-  cudaDeviceSynchronize();
-  wbTime_stop(Compute, "Performing CUDA computation");
+  //@@ Copy the GPU memory back to the CPU here
 
-  wbTime_start(Copy, "Copying output memory to the CPU");
-  cudaMemcpy(hostOutput, deviceOutput, sizeof(float) * dim, cudaMemcpyDeviceToHost);
-  wbTime_stop(Copy, "Copying output memory to the CPU");
 
-  wbTime_start(GPU, "Freeing GPU Memory");
-  cudaFree(deviceVector);
-  cudaFree(deviceOutput);
-  cudaFree(deviceJDSColStart);
-  cudaFree(deviceJDSCols);
-  cudaFree(deviceJDSRowPerm);
-  cudaFree(deviceJDSRows);
-  cudaFree(deviceJDSData);
+  //@@ Free the GPU memory here
 
-  wbTime_stop(GPU, "Freeing GPU Memory");
 
-  wbSolution(args, hostOutput, dim);
+  // Read expected output
+  float *expected = (float *)malloc(dim * sizeof(float));
+  {
+    FILE *f = fopen(expected_file, "r");
+    assert(f != NULL);
+    int expLen;
+    fscanf(f, "%d", &expLen);
+    for (int i = 0; i < expLen; i++) fscanf(f, "%f", &expected[i]);
+    fclose(f);
+  }
+
+  // Compare
+  if (memcmp(hostOutput, expected, dim * sizeof(float)) == 0) {
+    printf("Solution is correct\n");
+  } else {
+    for (int i = 0; i < dim; i++) {
+      if (hostOutput[i] != expected[i]) {
+        printf("Mismatch at offset %d, computed: %f, expected: %f\n",
+               i, hostOutput[i], expected[i]);
+        break;
+      }
+    }
+  }
 
   free(hostCSRCols);
   free(hostCSRRows);
@@ -130,6 +223,8 @@ int main(int argc, char **argv) {
   free(hostJDSRowPerm);
   free(hostJDSRows);
   free(hostJDSData);
+  free(expected);
+  for (int i = 0; i < num_inputs; i++) free(input_files[i]);
 
   return 0;
 }

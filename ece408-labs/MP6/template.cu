@@ -1,97 +1,114 @@
 // Histogram Equalization
 
-#include <wb.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <assert.h>
 
 #define HISTOGRAM_LENGTH 256
 #define BLOCK_SIZE       16
 
 //@@ insert code here
-__global__ void float2unsignedchar(float *input, unsigned char *output, int len){
-    int i = threadIdx.x + blockIdx.x * blockDim.x;
-    if (i < len){
-        output[i] = (unsigned char)(255 * input[i]);
-    }
+__global__ void float2unsignedchar(float *input, unsigned char *output, int len) {
+  //@@
 }
 
-__global__ void rgb2grayscale(unsigned char *input, unsigned char *output, int len){
-    int i = threadIdx.x + blockIdx.x * blockDim.x;
-    if (i < len){
-        unsigned char r = input[3 * i];
-        unsigned char g = input[3 * i + 1];
-        unsigned char b = input[3 * i + 2];
-        output[i] = (unsigned char)(0.21f * r + 0.71f * g + 0.07f * b);
-    }
+__global__ void rgb2grayscale(unsigned char *input, unsigned char *output, int len) {
+  //@@
 }
 
-__global__ void histogram(unsigned char *input, unsigned int *output, int len){
-    int i = threadIdx.x + blockIdx.x * blockDim.x;
-    __shared__ unsigned int histo[HISTOGRAM_LENGTH];
-    if (threadIdx.x < HISTOGRAM_LENGTH){
-        histo[threadIdx.x] = 0;
-    }
-    __syncthreads();
-    if (i < len){
-        atomicAdd(&(histo[input[i]]), 1); // subtotal in each block
-    }
-    __syncthreads();
-    if (threadIdx.x < HISTOGRAM_LENGTH){
-        atomicAdd(&(output[threadIdx.x]), histo[threadIdx.x]); // add the subtotal to the global memory
-    }
+__global__ void histogram(unsigned char *input, unsigned int *output, int len) {
+  //@@
 }
 
-__global__ void computeCDF(unsigned int *input, float *output, int len){
-    int i = threadIdx.x + blockIdx.x * blockDim.x;
-    __shared__ float cdf[HISTOGRAM_LENGTH];
-    if (i < HISTOGRAM_LENGTH){
-        cdf[i] = input[i];
-    }
-    __syncthreads();
-    for (int stride = 1; stride < HISTOGRAM_LENGTH; stride *= 2){
-        __syncthreads();
-        int index = (threadIdx.x + 1) * stride * 2 - 1;
-        if (index < HISTOGRAM_LENGTH){
-            cdf[index] += cdf[index - stride];
-        }
-    }
-    for (int stride = HISTOGRAM_LENGTH / 4; stride > 0; stride /= 2){
-        __syncthreads();
-        int index = (threadIdx.x + 1) * stride * 2 - 1;
-        if (index + stride < HISTOGRAM_LENGTH){
-            cdf[index + stride] += cdf[index];
-        }
-    }
-    __syncthreads();
-    if (i < HISTOGRAM_LENGTH){
-        output[i] = (float)cdf[i] * 1.0 / len;
-    }
+__global__ void computeCDF(unsigned int *input, float *output, int len) {
+  //@@
 }
 
-__global__ void equalize(unsigned char *image, float *cdf, int len){
-    int i = threadIdx.x + blockIdx.x * blockDim.x;
-    if (i < len){
-        float x = 255.0 * (cdf[image[i]] - cdf[0]) / (1 - cdf[0]);
-        float correctColor = min(max(x, 0.0f), 255.0f);
-        image[i] = (unsigned char)correctColor;
-    }
+__global__ void equalize(unsigned char *image, float *cdf, int len) {
+  //@@
 }
 
-__global__ void unsignedchar2float(unsigned char *input, float *output, int len){
-    int i = threadIdx.x + blockIdx.x * blockDim.x;
-    if (i < len){
-        output[i] = (float)input[i] * 1.0 / 255;
-    }
+__global__ void unsignedchar2float(unsigned char *input, float *output, int len) {
+  //@@
+}
+
+// Read a PPM P6 file, return float array with pixel values in [0,1]
+// Outputs: width, height, channels via pointers
+static float *readPPM(const char *filename, int *width, int *height, int *channels) {
+  FILE *f = fopen(filename, "rb");
+  assert(f != NULL);
+
+  char magic[3];
+  assert(fscanf(f, "%2s\n", magic) == 1);
+  assert(strcmp(magic, "P6") == 0);
+
+  // Skip comment lines
+  int c = fgetc(f);
+  while (c == '#') {
+    while (fgetc(f) != '\n');
+    c = fgetc(f);
+  }
+  ungetc(c, f);
+
+  int maxval;
+  assert(fscanf(f, "%d %d\n%d\n", width, height, &maxval) == 3);
+  *channels = 3;
+  assert(maxval == 255);
+
+  int npixels = (*width) * (*height) * (*channels);
+  unsigned char *raw = (unsigned char *)malloc(npixels);
+  assert(fread(raw, 1, npixels, f) == (size_t)npixels);
+  fclose(f);
+
+  float *data = (float *)malloc(npixels * sizeof(float));
+  for (int i = 0; i < npixels; i++) {
+    data[i] = (float)raw[i] / 255.0f;
+  }
+  free(raw);
+  return data;
 }
 
 int main(int argc, char **argv) {
-  wbArg_t args;
-  int imageWidth;
-  int imageHeight;
-  int imageChannels;
-  wbImage_t inputImage;
-  wbImage_t outputImage;
+  char *expected_file = NULL;
+  char *input_files[16];
+  int num_inputs = 0;
+  char *dataset_type = NULL;
+
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "-e") == 0 && i + 1 < argc) {
+      expected_file = argv[++i];
+    } else if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) {
+      char *start = argv[++i];
+      for (char *p = start; ; p++) {
+        if (*p == ',' || *p == '\0') {
+          input_files[num_inputs] = (char *)malloc(p - start + 1);
+          memcpy(input_files[num_inputs], start, p - start);
+          input_files[num_inputs][p - start] = '\0';
+          num_inputs++;
+          start = p + 1;
+          if (*p == '\0') break;
+        }
+      }
+    } else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
+      dataset_type = argv[++i];
+    }
+  }
+
+  if (!expected_file || num_inputs < 1) {
+    fprintf(stderr, "Usage: %s -e <expected> -i <input.ppm> -t <type>\n", argv[0]);
+    return 1;
+  }
+
+  int imageWidth, imageHeight, imageChannels;
   float *hostInputImageData;
   float *hostOutputImageData;
-  const char *inputImageFile;
+  int numPixels;
+
+  // Read input PPM image
+  hostInputImageData = readPPM(input_files[0], &imageWidth, &imageHeight, &imageChannels);
+  numPixels = imageWidth * imageHeight * imageChannels;
+  hostOutputImageData = (float *)malloc(numPixels * sizeof(float));
 
   //@@ Insert more code here
   float *deviceInoutImageData;
@@ -100,68 +117,43 @@ int main(int argc, char **argv) {
   unsigned int *deviceHistogram;
   float *deviceCDF;
 
-  args = wbArg_read(argc, argv); /* parse the input arguments */
+  //@@ Allocate GPU memory here
 
-  inputImageFile = wbArg_getInputFile(args, 0);
+  //@@ Copy input memory to the GPU here
 
-  wbTime_start(Generic, "Importing data and creating memory on host");
-  inputImage = wbImport(inputImageFile);
-  imageWidth = wbImage_getWidth(inputImage);
-  imageHeight = wbImage_getHeight(inputImage);
-  imageChannels = wbImage_getChannels(inputImage);
-  outputImage = wbImage_new(imageWidth, imageHeight, imageChannels);
-  hostInputImageData = wbImage_getData(inputImage);
-  hostOutputImageData = wbImage_getData(outputImage);
-  wbTime_stop(Generic, "Importing data and creating memory on host");
+  //@@ Initialize grid and block dimensions and launch kernels
+  // float2unsignedchar
+  // rgb2grayscale
+  // histogram
+  // computeCDF
+  // equalize
+  // unsignedchar2float
 
-  //@@ insert code here
-  wbTime_start(GPU, "Allocating GPU memory.");
-  cudaMalloc((void **)&deviceInoutImageData, imageWidth * imageHeight * imageChannels * sizeof(float));
-  cudaMalloc((void **)&deviceDataChar, imageWidth * imageHeight * imageChannels * sizeof(unsigned char));
-  cudaMalloc((void **)&deviceGrayscale, imageWidth * imageHeight * sizeof(unsigned char));
-  cudaMalloc((void **)&deviceHistogram, HISTOGRAM_LENGTH * sizeof(unsigned int));
-  cudaMalloc((void **)&deviceCDF, HISTOGRAM_LENGTH * sizeof(float));
-  wbTime_stop(GPU, "Allocating GPU memory.");
+  //@@ Copy output memory to the CPU here
 
-  wbTime_start(GPU, "Copying input memory to the GPU.");
-  cudaMemcpy(deviceInoutImageData, hostInputImageData, imageWidth * imageHeight * imageChannels * sizeof(float), cudaMemcpyHostToDevice);
-  wbTime_stop(GPU, "Copying input memory to the GPU.");
 
-  // Launch the kernel
-  dim3 dimBlock(BLOCK_SIZE * BLOCK_SIZE, 1, 1);
-  dim3 dimGrid((imageWidth * imageHeight * imageChannels + BLOCK_SIZE * BLOCK_SIZE - 1) / (BLOCK_SIZE * BLOCK_SIZE), 1, 1);
-  float2unsignedchar<<<dimGrid, dimBlock>>>(deviceInoutImageData, deviceDataChar, imageWidth * imageHeight * imageChannels);
-  cudaDeviceSynchronize();
+  // Read expected output PPM and convert to float for comparison
+  float *expected = readPPM(expected_file, &imageWidth, &imageHeight, &imageChannels);
 
-  dim3 dimBlock2(BLOCK_SIZE * BLOCK_SIZE, 1, 1);
-  dim3 dimGrid2((imageWidth * imageHeight + BLOCK_SIZE * BLOCK_SIZE - 1) / (BLOCK_SIZE * BLOCK_SIZE), 1, 1);
-  rgb2grayscale<<<dimGrid2, dimBlock2>>>(deviceDataChar, deviceGrayscale, imageWidth * imageHeight);
-  cudaDeviceSynchronize();
-
-  histogram<<<dimGrid2, dimBlock2>>>(deviceGrayscale, deviceHistogram, imageWidth * imageHeight);
-  cudaDeviceSynchronize();
-
-  computeCDF<<<1, HISTOGRAM_LENGTH>>>(deviceHistogram, deviceCDF, imageWidth * imageHeight);
-  cudaDeviceSynchronize();
-
-  equalize<<<dimGrid, dimBlock>>>(deviceDataChar, deviceCDF, imageWidth * imageHeight * imageChannels);
-  cudaDeviceSynchronize();
-
-  unsignedchar2float<<<dimGrid, dimBlock>>>(deviceDataChar, deviceInoutImageData, imageWidth * imageHeight * imageChannels);
-  cudaDeviceSynchronize();
-
-  wbTime_start(Copy, "Copying output memory to the CPU.");
-  cudaMemcpy(hostOutputImageData, deviceInoutImageData, imageWidth * imageHeight * imageChannels * sizeof(float), cudaMemcpyDeviceToHost);
-  wbTime_stop(Copy, "Copying output memory to the CPU.");
-
-  wbSolution(args, outputImage);
+  // Compare
+  if (memcmp(hostOutputImageData, expected, numPixels * sizeof(float)) == 0) {
+    printf("Solution is correct\n");
+  } else {
+    for (int i = 0; i < numPixels; i++) {
+      if (hostOutputImageData[i] != expected[i]) {
+        printf("Mismatch at offset %d, computed: %f, expected: %f\n",
+               i, hostOutputImageData[i], expected[i]);
+        break;
+      }
+    }
+  }
 
   //@@ insert code here
-  cudaFree(deviceInoutImageData);
-  cudaFree(deviceDataChar);
-  cudaFree(deviceGrayscale);
-  cudaFree(deviceHistogram);
-  cudaFree(deviceCDF);
+
+  free(hostInputImageData);
+  free(hostOutputImageData);
+  free(expected);
+  for (int i = 0; i < num_inputs; i++) free(input_files[i]);
 
   return 0;
 }

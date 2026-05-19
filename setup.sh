@@ -16,6 +16,7 @@ cd ~
 cd ~/projects
 git remote set-url origin "$(cat /mnt/.git_token)@github.com/lq458/CUDA_Learning.git"
 git pull 2>/dev/null
+cd ~/projects/ece408-labs
 
 echo "Ready. nvcc: $(nvcc --version | head -1)"
 ncu --version 2>/dev/null | head -1
