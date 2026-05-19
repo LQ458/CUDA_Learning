@@ -6,7 +6,7 @@
 
 __global__ void vecAdd(float *in1, float *in2, float *out, int len) {
   //@@ Insert code to implement vector addition here
-  for(i < len){
+  for(int i = 0; i < len; i++){
     out[i] = in1[i] + in2[i];
   }
 }
